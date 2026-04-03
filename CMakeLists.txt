@@ -9,8 +9,9 @@ project(app C)
 
 # App source files — add your .c files here
 set(APP_SOURCES
-    main/main.c
     main/crt0.c
+    main/main.c
+    main/modplayer_esp32.c
 )
 
 # Include directories — add paths to your headers here

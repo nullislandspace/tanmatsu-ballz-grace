@@ -1,10 +1,15 @@
 #include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
 #include "bsp/led.h"
 #include "bsp/power.h"
+#include "bsp/audio.h"
 #include "driver/gpio.h"
+#include "driver/i2s_std.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_types.h"
 #include "esp_log.h"
@@ -14,9 +19,31 @@
 #include "pax_gfx.h"
 #include "pax_text.h"
 #include "portmacro.h"
+#include "bounce_sounds.h"
+#include "modplayer_esp32.h"
+#include "logo_image.h"
+
+//#define CAVAC_DEBUG
 
 // Constants
-static char const TAG[] = "main";
+//static char const TAG[] = "main";
+
+// External BSP audio function (not in public header)
+extern void bsp_audio_initialize(uint32_t rate);
+
+// Audio constants
+#define MAX_ACTIVE_SOUNDS 5
+#define FRAMES_PER_WRITE  64
+#define SAMPLE_RATE       44100
+
+// Audio data structures
+typedef struct {
+    const int16_t* sample_data;    // Pointer to sound sample in flash
+    uint32_t sample_length;        // Total samples in sound
+    uint32_t playback_position;    // Current playback position
+    bool active;                   // Is this sound currently playing?
+    float volume;                  // Volume 0.0 to 1.0
+} active_sound_t;
 
 // Global variables
 static size_t                       display_h_res        = 0;
@@ -24,12 +51,98 @@ static size_t                       display_v_res        = 0;
 static lcd_color_rgb_pixel_format_t display_color_format = LCD_COLOR_PIXEL_FORMAT_RGB565;
 static lcd_rgb_data_endian_t        display_data_endian  = LCD_RGB_DATA_ENDIAN_LITTLE;
 static pax_buf_t                    fb                   = {0};
+static pax_buf_t                    logo_buf             = {0};  // Logo image buffer
 static QueueHandle_t                input_event_queue    = NULL;
+
+// Audio global variables
+static i2s_chan_handle_t i2s_handle = NULL;
+static active_sound_t active_sounds[MAX_ACTIVE_SOUNDS];
+static volatile bool sound_trigger[5] = {false, false, false, false, false};
 
 #if defined(CONFIG_BSP_TARGET_KAMI)
 // Temporary addition for supporting epaper devices (irrelevant for Tanmatsu)
 static pax_col_t palette[] = {0xffffffff, 0xff000000, 0xffff0000};  // white, black, red
 #endif
+
+// Audio mixing task
+void audio_task(void* arg) {
+    int16_t output_buffer[FRAMES_PER_WRITE * 2];  // Stereo: 2 channels per frame
+    size_t bytes_written;
+
+    while (1) {
+        // 1. Check for new sound triggers from main loop
+        for (int i = 0; i < 5; i++) {
+            if (sound_trigger[i]) {
+                // Find a free slot or reuse the slot for this sound
+                for (int slot = 0; slot < MAX_ACTIVE_SOUNDS; slot++) {
+                    if (!active_sounds[slot].active ||
+                        active_sounds[slot].sample_data == bounce_samples[i]) {
+                        active_sounds[slot].sample_data = bounce_samples[i];
+                        active_sounds[slot].sample_length = bounce_lengths[i];
+                        active_sounds[slot].playback_position = 0;
+                        active_sounds[slot].volume = 0.1f;  // 10% volume for ball sounds
+                        active_sounds[slot].active = true;
+                        break;
+                    }
+                }
+                sound_trigger[i] = false;  // Clear the trigger
+            }
+        }
+
+        // 2. Mix all active sounds into output buffer
+        for (int frame = 0; frame < FRAMES_PER_WRITE; frame++) {
+            float mix_left = 0.0f;
+            float mix_right = 0.0f;
+
+            // Add MOD background music (if available)
+            if (mod_read_pos != mod_write_pos) {
+                int16_t mod_sample = mod_ring_buffer[mod_read_pos];
+                float mod_sample_f = mod_sample / 32768.0f;
+                mix_left += mod_sample_f;
+                mix_right += mod_sample_f;
+                mod_read_pos = (mod_read_pos + 1) % MOD_BUFFER_SIZE;
+            }
+
+            // Accumulate all active sounds
+            for (int i = 0; i < MAX_ACTIVE_SOUNDS; i++) {
+                if (active_sounds[i].active) {
+                    // Get sample value
+                    int16_t sample = active_sounds[i].sample_data[
+                        active_sounds[i].playback_position
+                    ];
+
+                    // Convert to float (-1.0 to 1.0) and apply volume
+                    float sample_f = (sample / 32768.0f) * active_sounds[i].volume;
+
+                    // Accumulate (mono to stereo)
+                    mix_left += sample_f;
+                    mix_right += sample_f;
+
+                    // Advance playback position
+                    active_sounds[i].playback_position++;
+                    if (active_sounds[i].playback_position >=
+                        active_sounds[i].sample_length) {
+                        active_sounds[i].active = false;  // Sound finished
+                    }
+                }
+            }
+
+            // Soft clip to prevent distortion
+            mix_left = fminf(1.0f, fmaxf(-1.0f, mix_left));
+            mix_right = fminf(1.0f, fmaxf(-1.0f, mix_right));
+
+            // Convert back to 16-bit stereo
+            output_buffer[frame * 2] = (int16_t)(mix_left * 32767.0f);
+            output_buffer[frame * 2 + 1] = (int16_t)(mix_right * 32767.0f);
+        }
+
+        // 3. Write to I2S (blocks until DMA buffer is ready, ~1.45ms)
+        if (i2s_handle != NULL) {
+            i2s_channel_write(i2s_handle, output_buffer,
+                            sizeof(output_buffer), &bytes_written, portMAX_DELAY);
+        }
+    }
+}
 
 void blit(void) {
     bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
@@ -39,71 +152,111 @@ void app_main(void) {
     // Start the GPIO interrupt service
     gpio_install_isr_service(0);
 
-    // Initialize the Non Volatile Storage partition
+    // Initialize the Non Volatile Storage service
     esp_err_t res = nvs_flash_init();
     if (res == ESP_ERR_NVS_NO_FREE_PAGES || res == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        res = nvs_flash_erase();
-        if (res != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to erase NVS flash: %d", res);
-            return;
-        }
+        ESP_ERROR_CHECK(nvs_flash_erase());
         res = nvs_flash_init();
     }
-    if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize NVS flash: %d", res);
-        return;
-    }
+    ESP_ERROR_CHECK(res);
 
     // Initialize the Board Support Package
     const bsp_configuration_t bsp_configuration = {
         .display =
             {
-                .requested_color_format = LCD_COLOR_PIXEL_FORMAT_RGB888,
+                .requested_color_format = display_color_format,
                 .num_fbs                = 1,
             },
     };
-    res = bsp_device_initialize(&bsp_configuration);
-    if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize BSP: %d", res);
-        return;
-    }
+    ESP_ERROR_CHECK(bsp_device_initialize(&bsp_configuration));
+
+    // Initialize audio subsystem
+    bsp_audio_initialize(SAMPLE_RATE);
+    bsp_audio_get_i2s_handle(&i2s_handle);
+    bsp_audio_set_amplifier(true);   // Enable amplifier
+    bsp_audio_set_volume(100);       // Set master volume to maximum
+
+    // Initialize active sounds array
+    memset(active_sounds, 0, sizeof(active_sounds));
+
+    // Initialize MOD player
+    modplayer_init();
+
+    // Create audio mixing task on Core 1 with high priority
+    xTaskCreatePinnedToCore(
+        audio_task,
+        "audio",
+        4096,                           // Stack size
+        NULL,                           // Parameters
+        configMAX_PRIORITIES - 2,       // High priority
+        NULL,                           // Task handle
+        1                               // Pin to Core 1
+    );
+
+    // Create MOD player task on Core 1 with lower priority
+    xTaskCreatePinnedToCore(
+        modplayer_task,
+        "modplayer",
+        8192,                           // Stack size (larger for MOD processing)
+        NULL,                           // Parameters
+        configMAX_PRIORITIES - 3,       // Lower priority than audio task
+        NULL,                           // Task handle
+        1                               // Pin to Core 1
+    );
+
+    uint8_t led_data[] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    bsp_led_write(led_data, sizeof(led_data));
 
     // Get display parameters and rotation
     res = bsp_display_get_parameters(&display_h_res, &display_v_res, &display_color_format, &display_data_endian);
-    if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get display parameters: %d", res);
-        return;
-    }
+    ESP_ERROR_CHECK(res);  // Check that the display parameters have been initialized
+    bsp_display_rotation_t display_rotation = bsp_display_get_default_rotation();
+
+    char debugrotation[20] = "";
+    char debugcolor[20] = "";
+    char debugwidth[20] = "";
+    char debugheight[20] = "";
+
+    sprintf(debugwidth, "WIDTH: %d", display_h_res);
+    sprintf(debugheight, "HEIGHT: %d", display_v_res);
 
     // Convert ESP-IDF color format into PAX buffer type
     pax_buf_type_t format = PAX_BUF_24_888RGB;
+    sprintf(debugcolor, "Mode RGB888");
     switch (display_color_format) {
         case LCD_COLOR_PIXEL_FORMAT_RGB565:
             format = PAX_BUF_16_565RGB;
+            sprintf(debugcolor, "Mode RGB565");
             break;
         case LCD_COLOR_PIXEL_FORMAT_RGB888:
             format = PAX_BUF_24_888RGB;
+            sprintf(debugcolor, "Mode RGB888");
             break;
         default:
             break;
     }
 
     // Convert BSP display rotation format into PAX orientation type
-    bsp_display_rotation_t display_rotation = bsp_display_get_default_rotation();
     pax_orientation_t orientation = PAX_O_UPRIGHT;
     switch (display_rotation) {
         case BSP_DISPLAY_ROTATION_90:
             orientation = PAX_O_ROT_CCW;
+            sprintf(debugrotation, "Rot: 90");
             break;
         case BSP_DISPLAY_ROTATION_180:
             orientation = PAX_O_ROT_HALF;
+            sprintf(debugrotation, "Rot: 180");
             break;
         case BSP_DISPLAY_ROTATION_270:
             orientation = PAX_O_ROT_CW;
+            sprintf(debugrotation, "Rot: 270");
             break;
         case BSP_DISPLAY_ROTATION_0:
         default:
             orientation = PAX_O_UPRIGHT;
+            sprintf(debugrotation, "Rot: 0");
             break;
     }
 
@@ -121,6 +274,9 @@ void app_main(void) {
 #endif
     pax_buf_set_orientation(&fb, orientation);
 
+    // Initialize logo buffer (already pre-rotated in the image data)
+    pax_buf_init(&logo_buf, (void*)logo_image_data, LOGO_WIDTH, LOGO_HEIGHT, PAX_BUF_24_888RGB);
+
 #if defined(CONFIG_BSP_TARGET_KAMI)
 #define BLACK 0
 #define WHITE 1
@@ -134,102 +290,93 @@ void app_main(void) {
     // Get input event queue from BSP
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
-    // LEDs
-    bsp_led_set_pixel(0, 0xFF0000);  // Red
-    bsp_led_set_pixel(1, 0x00FF00);  // Green
-    bsp_led_set_pixel(2, 0x0000FF);  // Blue
-    bsp_led_set_pixel(3, 0xFFFF00);  // Yellow
-    bsp_led_set_pixel(4, 0x00FFFF);  // Magenta
-    bsp_led_set_pixel(5, 0xFF00FF);  // Cyan
-    bsp_led_send();                  // Send data to the coprocessor
-    bsp_led_set_mode(false);         // Take control over all LEDs by disabling automatic mode
-
     // Main section of the app
 
-    // This example shows how to read from the BSP event queue to read input events
+    // Bounce some balls around the screen
+    //
+    // On every bounce, light up one LED with the specific ball color, also blink the keyboard
 
-    // If you want to run something at an interval in this same main thread you can replace portMAX_DELAY with an amount
-    // of ticks to wait, for example pdMS_TO_TICKS(1000)
 
-    pax_background(&fb, WHITE);
-    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Welcome! Press any key to trigger an event.");
-    blit();
+    // Setup data for the balls, "physics" and the corresponding LEDs
+    int32_t xoffs[5] = {100, 130, 170, 230, 335}; // Starting X position of balls
+    int32_t yoffs[5] = {100, 107, 209, 305, 227}; // Starting Y position of balls
+    int32_t xspeed[5] = {2, 1, -1, 3, -2}; // X speed (delta) of balls
+    int32_t yspeed[5] = {1, -1, 2, -2, 3}; // Y speed (delta) of balls
+    uint32_t color[5] = {0xFFFF0000, 0xFF00FF00, 0xFFFF00FF, 0xFF00FFFF, 0xFFFFFF00}; // Ball colors
+    bool bounce[5] = {false, false, false, false, false}; // Has bounced this render cycle
 
-    while (1) {
+    uint8_t led_offs[5] = {0 * 3, 1 * 3, 2 * 3, 4 * 3, 5 * 3};  // Starting offset in the led_data for the corresponding balls
+    uint8_t led_colormap[15] = {0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00}; // Color of the balls, split into bytes
+
+    // Bounce sound frequencies: 440, 554, 659, 784, 880 Hz (pentatonic scale)
+    // Sound samples are pre-generated and loaded from bounce_sounds.h
+
+    uint8_t i;
+    uint8_t ledoffs;
+    uint32_t delay = pdMS_TO_TICKS(1);  // 1ms timeout for responsive input
+    uint8_t bright = 100;
+    while(1) {
         bsp_input_event_t event;
-        if (xQueueReceive(input_event_queue, &event, portMAX_DELAY) == pdTRUE) {
-            switch (event.type) {
-                case INPUT_EVENT_TYPE_KEYBOARD: {
-                    if (event.args_keyboard.ascii != '\b' ||
-                        event.args_keyboard.ascii != '\t') {  // Ignore backspace & tab keyboard events
-                        ESP_LOGI(TAG, "Keyboard event %c (%02x) %s", event.args_keyboard.ascii,
-                                 (uint8_t)event.args_keyboard.ascii, event.args_keyboard.utf8);
-                        pax_simple_rect(&fb, WHITE, 0, 0, pax_buf_get_width(&fb), 72);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Keyboard event");
-                        char text[64];
-                        snprintf(text, sizeof(text), "ASCII:     %c (0x%02x)", event.args_keyboard.ascii,
-                                 (uint8_t)event.args_keyboard.ascii);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 18, text);
-                        snprintf(text, sizeof(text), "UTF-8:     %s", event.args_keyboard.utf8);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 36, text);
-                        snprintf(text, sizeof(text), "Modifiers: 0x%0" PRIX32, event.args_keyboard.modifiers);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 54, text);
-                        blit();
-                    }
-                    break;
-                }
-                case INPUT_EVENT_TYPE_NAVIGATION: {
-                    ESP_LOGI(TAG, "Navigation event %0" PRIX32 ": %s", (uint32_t)event.args_navigation.key,
-                             event.args_navigation.state ? "pressed" : "released");
+        if (xQueueReceive(input_event_queue, &event, delay) == pdTRUE) {
+            bsp_device_restart_to_launcher();
+        }
+        // Draw black background
+        pax_background(&fb, BLACK);
+        // Draw centered logo (logo is pre-rotated, fb is also rotated)
+        int fb_w = pax_buf_get_width(&fb);
+        int fb_h = pax_buf_get_height(&fb);
+        pax_draw_image_op(&fb, &logo_buf, (fb_w - LOGO_WIDTH) / 2, (fb_h - LOGO_HEIGHT) / 2);
+        //pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Press any key to exit the demo.");
 
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F1) {
-                        bsp_device_restart_to_launcher();
-                    }
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F2) {
-                        bsp_input_set_backlight_brightness(0);
-                    }
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F3) {
-                        bsp_input_set_backlight_brightness(100);
-                    }
+#ifdef CAVAC_DEBUG
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 40, debugrotation); // Tanmatsu: 270
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 60, debugcolor); // Tanmatsu: 565
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 80, debugwidth); // Tanmatsu: 480
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 100, debugheight); // Tanmatsu: 800
+#endif // CAVAC_DEBUG
 
-                    pax_simple_rect(&fb, WHITE, 0, 100, pax_buf_get_width(&fb), 72);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 0, "Navigation event");
-                    char text[64];
-                    snprintf(text, sizeof(text), "Key:       0x%0" PRIX32, (uint32_t)event.args_navigation.key);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 18, text);
-                    snprintf(text, sizeof(text), "State:     %s", event.args_navigation.state ? "pressed" : "released");
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 36, text);
-                    snprintf(text, sizeof(text), "Modifiers: 0x%0" PRIX32, event.args_navigation.modifiers);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 54, text);
-                    blit();
-                    break;
-                }
-                case INPUT_EVENT_TYPE_ACTION: {
-                    ESP_LOGI(TAG, "Action event 0x%0" PRIX32 ": %s", (uint32_t)event.args_action.type,
-                             event.args_action.state ? "yes" : "no");
-                    pax_simple_rect(&fb, WHITE, 0, 200 + 0, pax_buf_get_width(&fb), 72);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 200 + 0, "Action event");
-                    char text[64];
-                    snprintf(text, sizeof(text), "Type:      0x%0" PRIX32, (uint32_t)event.args_action.type);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 200 + 36, text);
-                    snprintf(text, sizeof(text), "State:     %s", event.args_action.state ? "yes" : "no");
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 200 + 54, text);
-                    blit();
-                    break;
-                }
-                case INPUT_EVENT_TYPE_SCANCODE: {
-                    ESP_LOGI(TAG, "Scancode event 0x%0" PRIX32, (uint32_t)event.args_scancode.scancode);
-                    pax_simple_rect(&fb, WHITE, 0, 300 + 0, pax_buf_get_width(&fb), 72);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 300 + 0, "Scancode event");
-                    char text[64];
-                    snprintf(text, sizeof(text), "Scancode:  0x%0" PRIX32, (uint32_t)event.args_scancode.scancode);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 300 + 36, text);
-                    blit();
-                    break;
-                }
-                default:
-                    break;
+        memset(led_data, 0, 18); // LEDS OFF
+        led_data[(3 * 3) + 0] = 0xFF; // Power LED on
+        led_data[(3 * 3) + 1] = 0xFF;
+
+        for(i = 0; i < 5; i++) {
+            bounce[i] = false;
+            xoffs[i] += xspeed[i];
+            if(xoffs[i] < 1 || xoffs[i] > (display_h_res - 50)) {
+                xspeed[i] *= -1;
+                xoffs[i] += xspeed[i];
+                bright = 100;
+                bounce[i] = true;
+
+            }
+            yoffs[i] += yspeed[i];
+            if(yoffs[i] < 1 || yoffs[i] > (display_v_res - 50)) {
+                yspeed[i] *= -1;
+                yoffs[i] += yspeed[i];
+                bright = 100;
+                bounce[i] = true;
+            }
+            pax_draw_circle(&fb, color[i], yoffs[i] + 25, xoffs[i] + 25, 25);
+            if(bounce[i]) {
+                pax_draw_circle(&fb, BLACK, yoffs[i] + 25, xoffs[i] + 25, 15);
+                pax_draw_circle(&fb, WHITE, yoffs[i] + 25, xoffs[i] + 25, 10);
+
+                ledoffs = led_offs[i];
+
+                // Trigger bounce sound for this ball
+                sound_trigger[i] = true;
+
+                // For some strange reason, the LED array seems to expect G R B (instead of R G B), so we swap the bytes accordingly
+                led_data[ledoffs + 0] = led_colormap[(i * 3) + 1];
+                led_data[ledoffs + 1] = led_colormap[(i * 3) + 0];
+                led_data[ledoffs + 2] = led_colormap[(i * 3) + 2];
             }
         }
+        bsp_input_set_backlight_brightness(bright);
+        if(bright > 0) {
+            bright -= 25;
+        }
+        blit();
+        bsp_led_write(led_data, sizeof(led_data));
     }
 }

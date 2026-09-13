@@ -11,6 +11,7 @@ project(app C)
 set(APP_SOURCES
     main/crt0.c
     main/main.c
+    main/app_volume.c
     main/modplayer_esp32.c
 )
 

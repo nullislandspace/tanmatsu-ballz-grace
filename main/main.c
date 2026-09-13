@@ -23,6 +23,7 @@
 #include "bounce_sounds.h"
 #include "modplayer_esp32.h"
 #include "logo_image.h"
+#include "app_volume.h"
 
 //#define CAVAC_DEBUG
 
@@ -174,8 +175,7 @@ void app_main(void) {
     // Initialize audio subsystem
     bsp_audio_initialize(SAMPLE_RATE);
     bsp_audio_get_i2s_handle(&i2s_handle);
-    bsp_audio_set_amplifier(true);   // Enable amplifier
-    bsp_audio_set_volume(100);       // Set master volume to maximum
+    app_volume_init();               // Amplifier and volume from the global settings
 
     // Initialize active sounds array
     memset(active_sounds, 0, sizeof(active_sounds));
@@ -318,7 +318,7 @@ void app_main(void) {
     uint8_t bright = 100;
     while(1) {
         bsp_input_event_t event;
-        if (xQueueReceive(input_event_queue, &event, delay) == pdTRUE) {
+        if (xQueueReceive(input_event_queue, &event, delay) == pdTRUE && !app_volume_handle_event(&event)) {
             bsp_device_restart_to_launcher();
         }
         // Draw black background
